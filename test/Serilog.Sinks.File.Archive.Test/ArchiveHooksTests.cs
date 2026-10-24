@@ -56,9 +56,11 @@ namespace Serilog.Sinks.File.Archive.Tests
                 var messages = new ConcurrentQueue<string>();
                 System.IO.File.WriteAllText(failedPath, "recover me");
                 System.IO.File.WriteAllText(nextPath, "next event");
+                // A file at the directory path forces the first archive attempt to fail before writing an archive.
                 System.IO.File.WriteAllText(target, "prevents directory creation");
 
                 // Pause the failed job inside its diagnostic callback to prove enqueueing returns before the worker finishes.
+                // failureObserved signals that the worker reached this point; releaseWorker lets the test resume it.
                 SelfLog.Enable(message =>
                 {
                     messages.Enqueue(message);
@@ -68,10 +70,12 @@ namespace Serilog.Sinks.File.Archive.Tests
 
                 try
                 {
+                    // Run enqueueing separately so the timeout also detects an accidental wait for the blocked worker.
                     var enqueue = Task.Run(() => hooks.OnFileDeleting(failedPath));
                     await AwaitWithTimeout(enqueue);
                     failureObserved.Wait(TimeSpan.FromSeconds(15)).ShouldBeTrue();
 
+                    // This task represents the queue so far. The renamed source must remain available for recovery.
                     var firstFlush = hooks.BackgroundRunningArchiveTask();
                     firstFlush.IsCompleted.ShouldBeFalse();
                     var pendingPath = Directory.GetFiles(temp.Path, "*.archive-pending").Single();
@@ -81,6 +85,7 @@ namespace Serilog.Sinks.File.Archive.Tests
                     // Remove the obstacle and queue a second file while the first job is still paused.
                     System.IO.File.Delete(target);
                     hooks.OnFileDeleting(nextPath);
+                    // The new snapshot includes the second job, which must wait for the first job to finish.
                     var secondFlush = hooks.BackgroundRunningArchiveTask();
                     secondFlush.ShouldNotBeSameAs(firstFlush);
                     secondFlush.IsCompleted.ShouldBeFalse();
@@ -90,6 +95,7 @@ namespace Serilog.Sinks.File.Archive.Tests
                     releaseWorker.Set();
                     await AwaitWithTimeout(secondFlush);
 
+                    // Failure must not stop later jobs: only the failed source remains, and the second archive is readable.
                     System.IO.File.ReadAllText(pendingPath).ShouldBe("recover me");
                     System.IO.File.Exists(nextPath).ShouldBeFalse();
                     Utils.DecompressLines(Path.Combine(target, "log_002.log.gz")).ShouldBe(new[] { "next event" });
